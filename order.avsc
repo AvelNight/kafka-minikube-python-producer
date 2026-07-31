@@ -1,0 +1,26 @@
+{
+  "type": "record",
+  "name": "Order",
+  "namespace": "demo",
+  "doc": "Учебное сообщение заказа для Avro producer",
+  "fields": [
+    {
+      "name": "mode",
+      "type": "string",
+      "doc": "Режим отправки: fire-and-forget / sync / async"
+    },
+    {
+      "name": "id",
+      "type": "int"
+    },
+    {
+      "name": "text",
+      "type": "string"
+    },
+    {
+      "name": "ts",
+      "type": "double",
+      "doc": "Unix timestamp"
+    }
+  ]
+}
