@@ -1,59 +1,76 @@
 """
-Kafka producer: три способа отправки сообщений.
+Kafka Avro producer: три способа отправки сообщений.
 
 1) Fire-and-forget  — отправил и забыл
 2) Synchronous      — ждём подтверждение брокера
-3) Asynchronous     — не блокируем цикл, обрабатываем результат в callback
+3) Asynchronous     — обрабатываем результат в callback
 
-Перед запуском:
+Перед запуском (два терминала):
+
+  kubectl apply -f schema-registry.yaml
+  kubectl rollout status deployment/schema-registry -n kafka
+
   kubectl port-forward -n kafka svc/kafka-controller-0-external 30093:9094
+  kubectl port-forward -n kafka svc/schema-registry 8081:8081
 
+  pip install -r requirements.txt
   python producer.py
 """
 
-from kafka import KafkaProducer
-from kafka.errors import KafkaError
-from kafka.serializer import Serializer
-import json
+from __future__ import annotations
+
 import time
+from pathlib import Path
 from typing import Any
 
-BOOTSTRAP_SERVERS = ["localhost:30093"]
+from confluent_kafka import KafkaError, KafkaException, SerializingProducer
+from confluent_kafka.schema_registry import SchemaRegistryClient
+from confluent_kafka.schema_registry.avro import AvroSerializer
+from confluent_kafka.serialization import SerializationContext, StringSerializer
+
+BOOTSTRAP_SERVERS = "localhost:30093"
+SCHEMA_REGISTRY_URL = "http://localhost:8081/apis/ccompat/v7"
 TOPIC = "order"
+SCHEMA_PATH = Path(__file__).with_name("order.avsc")
 
 
-class JsonSerializer(Serializer):
-    """Превращает Python-объект (dict/list) в JSON-байты."""
-
-    def serialize(self, topic, data):
-        if data is None:
-            return None
-        return json.dumps(data, ensure_ascii=False).encode("utf-8")
+def load_schema() -> str:
+    return SCHEMA_PATH.read_text(encoding="utf-8")
 
 
-class StringSerializer(Serializer):
-    """Превращает строковый key в bytes."""
+def order_to_dict(order: dict[str, Any], ctx: SerializationContext) -> dict[str, Any]:
+    """
+    AvroSerializer вызывает to_dict перед кодированием.
+    У нас value уже dict, совместимый со схемой — возвращаем как есть.
+    """
+    return order
 
-    def serialize(self, topic, data):
-        if data is None:
-            return None
-        return data.encode("utf-8")
 
+def create_producer() -> SerializingProducer:
+    schema_registry_client = SchemaRegistryClient({"url": SCHEMA_REGISTRY_URL})
 
-def create_producer() -> KafkaProducer:
-    return KafkaProducer(
-        bootstrap_servers=BOOTSTRAP_SERVERS,
-        value_serializer=JsonSerializer(),
-        key_serializer=StringSerializer(),
-        # Для fire-and-forget часто ставят acks=0 или acks=1.
-        # Для учёбы оставляем acks=all: надёжнее видно разницу режимов.
-        acks="all",
-        retries=3,
-        linger_ms=10,
+    avro_serializer = AvroSerializer(
+        schema_registry_client,
+        load_schema(),
+        order_to_dict,
+    )
+
+    return SerializingProducer(
+        {
+            "bootstrap.servers": BOOTSTRAP_SERVERS,
+            # key — обычная строка
+            "key.serializer": StringSerializer("utf_8"),
+            # value — Avro + Schema Registry
+            "value.serializer": avro_serializer,
+            "acks": "all",
+            "retries": 3,
+            "linger.ms": 10,
+        }
     )
 
 
 def build_message(mode: str, i: int) -> dict[str, Any]:
+    # Поля должны совпадать с order.avsc
     return {
         "mode": mode,
         "id": i,
@@ -65,34 +82,30 @@ def build_message(mode: str, i: int) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # 1) Fire-and-forget: сделать и забыть
 # ---------------------------------------------------------------------------
-def send_fire_and_forget(producer: KafkaProducer, count: int = 3) -> None:
+def send_fire_and_forget(producer: SerializingProducer, count: int = 3) -> None:
     """
-    Отправляем сообщение и НЕ ждём результат.
+    produce() без ожидания результата.
 
-    Плюсы:
-      - максимальная скорость
-      - простой код
-    Минусы:
-      - не знаем, дошло ли сообщение
-      - ошибки легко пропустить
+    Плюсы: быстро и просто.
+    Минусы: не знаем, дошло ли сообщение.
     """
     print("\n=== 1) Fire-and-forget ===")
 
     for i in range(count):
         message = build_message("fire-and-forget", i)
 
-        # send() кладёт сообщение в буфер producer'а и сразу возвращает Future.
-        # Мы Future игнорируем — это и есть "отправил и забыл".
-        producer.send(
-            TOPIC,
+        # on_delivery не передаём — результат не обрабатываем
+        producer.produce(
+            topic=TOPIC,
             key=f"ff-{i}",
             value=message,
         )
+        # poll(0) обслуживает внутренние очереди клиента, не блокирует
+        producer.poll(0)
         print(f"queued (no wait): {message}")
 
-    # Буфер ещё может быть не отправлен в сеть.
-    # flush() здесь опционален: без него часть сообщений может потеряться
-    # при быстром close(). Для демо оставляем, чтобы сообщения точно ушли.
+    # Для демо flush(), иначе при быстром выходе часть сообщений
+    # может остаться в буфере. В чистом fire-and-forget flush можно не делать.
     producer.flush()
     print("fire-and-forget: flush done")
 
@@ -100,97 +113,96 @@ def send_fire_and_forget(producer: KafkaProducer, count: int = 3) -> None:
 # ---------------------------------------------------------------------------
 # 2) Синхронная отправка
 # ---------------------------------------------------------------------------
-def send_sync(producer: KafkaProducer, count: int = 3) -> None:
+def send_sync(producer: SerializingProducer, count: int = 3) -> None:
     """
-    После каждой send() ждём подтверждение брокера через future.get().
+    После каждого produce() делаем flush() — ждём доставку.
 
-    Плюсы:
-      - сразу видим успех/ошибку
-      - проще отладка
-    Минусы:
-      - медленнее: ждём сеть + брокер на каждое сообщение
+    Плюсы: сразу видим успех/ошибку.
+    Минусы: медленнее.
     """
     print("\n=== 2) Synchronous send ===")
 
     for i in range(count):
         message = build_message("sync", i)
+        delivery: dict[str, Any] = {"error": None, "msg": None}
 
-        future = producer.send(
-            TOPIC,
+        def on_delivery(err, msg, result=delivery):
+            result["error"] = err
+            result["msg"] = msg
+
+        producer.produce(
+            topic=TOPIC,
             key=f"sync-{i}",
             value=message,
+            on_delivery=on_delivery,
         )
 
-        try:
-            # Блокируемся, пока брокер не подтвердит запись (или не будет ошибка).
-            metadata = future.get(timeout=10)
-            print(
-                f"confirmed: topic={metadata.topic} "
-                f"partition={metadata.partition} "
-                f"offset={metadata.offset} "
-                f"value={message}"
-            )
-        except KafkaError as e:
-            # Ошибка по конкретному сообщению — можно залогировать и продолжить
-            # или прервать отправку, в зависимости от бизнес-логики.
-            print(f"sync send failed for {message}: {e}")
-            raise
+        # flush() блокируется, пока сообщение не будет доставлено (или ошибка)
+        remaining = producer.flush(timeout=10)
+        if remaining > 0:
+            raise KafkaException(f"sync flush timeout, remaining={remaining}")
+
+        if delivery["error"] is not None:
+            raise KafkaException(delivery["error"])
+
+        msg = delivery["msg"]
+        print(
+            f"confirmed: topic={msg.topic()} "
+            f"partition={msg.partition()} "
+            f"offset={msg.offset()} "
+            f"value={message}"
+        )
 
 
 # ---------------------------------------------------------------------------
 # 3) Асинхронная отправка
 # ---------------------------------------------------------------------------
-def _on_send_success(metadata, message: dict[str, Any]) -> None:
-    """Callback при успешной доставке."""
+def _on_delivery(err, msg) -> None:
+    """Общий callback для async-режима."""
+    if err is not None:
+        print(f"async FAIL: {err}")
+        return
+
     print(
-        f"async OK: topic={metadata.topic} "
-        f"partition={metadata.partition} "
-        f"offset={metadata.offset} "
-        f"value={message}"
+        f"async OK: topic={msg.topic()} "
+        f"partition={msg.partition()} "
+        f"offset={msg.offset()} "
+        f"key={msg.key()}"
     )
 
 
-def _on_send_error(exc: Exception, message: dict[str, Any]) -> None:
-    """Callback при ошибке доставки."""
-    print(f"async FAIL: value={message} error={exc}")
-
-
-def send_async(producer: KafkaProducer, count: int = 3) -> None:
+def send_async(producer: SerializingProducer, count: int = 3) -> None:
     """
-    Отправляем сообщения без блокировки цикла.
-    Результат обрабатываем позже через callback на Future.
+    produce() с on_delivery: цикл не ждёт каждое сообщение.
+    Результаты приходят позже в callback.
 
-    Плюсы:
-      - быстрее sync (не ждём каждое сообщение в цикле)
-      - ошибки всё равно обрабатываем
-    Минусы:
-      - сложнее порядок логов/обработки
-      - нужно помнить про flush()/close() в конце
+    Плюсы: быстрее sync, ошибки всё равно ловим.
+    Минусы: порядок логов может отличаться от порядка отправки.
     """
     print("\n=== 3) Asynchronous send ===")
 
     for i in range(count):
         message = build_message("async", i)
 
-        future = producer.send(
-            TOPIC,
+        producer.produce(
+            topic=TOPIC,
             key=f"async-{i}",
             value=message,
+            on_delivery=_on_delivery,
         )
-
-        # add_callback / add_errback вызываются в I/O-потоке producer'а,
-        # когда брокер ответил. Цикл for при этом не блокируется.
-        future.add_callback(_on_send_success, message)
-        future.add_errback(_on_send_error, message)
-
+        producer.poll(0)
         print(f"queued async: {message}")
 
-    # Ждём, пока все async-отправки завершатся и сработают callback'и.
     producer.flush()
     print("async: flush done (callbacks should have finished)")
 
 
 def main() -> None:
+    print(f"Kafka bootstrap: {BOOTSTRAP_SERVERS}")
+    print(f"Schema Registry: {SCHEMA_REGISTRY_URL}")
+    print(f"Topic: {TOPIC}")
+    print(f"Schema: {SCHEMA_PATH.name}")
+
     producer = create_producer()
 
     try:
@@ -198,12 +210,11 @@ def main() -> None:
         send_sync(producer)
         send_async(producer)
         print("\nall modes done")
-    except KafkaError as e:
+    except (KafkaException, KafkaError) as e:
         print(f"Kafka error: {e}")
         raise
     finally:
-        # close() сам делает flush и освобождает ресурсы.
-        producer.close()
+        producer.flush()
 
 
 if __name__ == "__main__":
