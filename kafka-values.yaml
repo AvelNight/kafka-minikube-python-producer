@@ -1,0 +1,77 @@
+global:
+  security:
+    allowInsecureImages: true
+
+image:
+  repository: bitnamilegacy/kafka
+  tag: 4.0.0-debian-12-r10
+
+# Один узел: controller + broker
+controller:
+  replicaCount: 1
+  controllerOnly: false
+  automountServiceAccountToken: true
+
+  persistence:
+    enabled: true
+    size: 2Gi
+
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: 500m
+      memory: 1Gi
+
+  overrideConfiguration:
+    log.dirs: /bitnami/kafka/data
+    # num.partitions: 3
+    # auto.create.topics.enable: "true"
+
+# Отдельные broker-поды не создаём
+broker:
+  replicaCount: 0
+  automountServiceAccountToken: true
+
+# Без SASL/TLS — только для локальной учёбы
+listeners:
+  client:
+    protocol: PLAINTEXT
+  controller:
+    protocol: PLAINTEXT
+  interbroker:
+    protocol: PLAINTEXT
+  external:
+    protocol: PLAINTEXT
+
+# autoDiscovery выключен, чтобы не подставлялся 192.168.49.2
+defaultInitContainers:
+  autoDiscovery:
+    enabled: false
+    image:
+      registry: docker.io
+      repository: bitnamilegacy/kubectl
+      tag: 1.33.4-debian-12-r0
+
+rbac:
+  create: true
+
+# EXTERNAL для Python с Mac через localhost
+externalAccess:
+  enabled: true
+
+  controller:
+    service:
+      type: NodePort
+      nodePorts:
+        - 30093
+      domain: localhost
+      useHostIPs: false
+
+  # Нужен из‑за валидации Bitnami при broker.replicaCount=0
+  broker:
+    service:
+      type: ClusterIP
+      domain: localhost
+      nodePorts: []
