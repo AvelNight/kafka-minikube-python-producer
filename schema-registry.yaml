@@ -1,0 +1,65 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: schema-registry
+  namespace: kafka
+  labels:
+    app: schema-registry
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: schema-registry
+  template:
+    metadata:
+      labels:
+        app: schema-registry
+    spec:
+      containers:
+        - name: schema-registry
+          # In-memory Apicurio: без Kafka leader election, проще для Minikube
+          image: apicurio/apicurio-registry-mem:2.6.5.Final
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: REGISTRY_UI_CONFIG_APIURL
+              value: http://localhost:8081/apis/registry/v2
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: schema-registry
+  namespace: kafka
+  labels:
+    app: schema-registry
+spec:
+  type: ClusterIP
+  selector:
+    app: schema-registry
+  ports:
+    # Снаружи оставляем привычный 8081
+    - name: http
+      port: 8081
+      targetPort: http
