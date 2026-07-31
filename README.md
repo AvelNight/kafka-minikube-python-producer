@@ -1,82 +1,109 @@
-# Kafka Python Producer (Minikube)
+# Kafka Python Avro Producer (Minikube)
 
-Учебный пример Kafka producer на Python с тремя режимами отправки:
+Учебный пример Kafka producer на Python + **Avro** + **Schema Registry** с тремя режимами отправки:
 
 1. **Fire-and-forget** — отправил и забыл
 2. **Synchronous** — ждём подтверждение брокера
 3. **Asynchronous** — callback на успех/ошибку
 
-Также в репозитории есть `kafka-values.yaml` для развёртывания Kafka в Minikube через Helm (Bitnami, KRaft, `EXTERNAL://localhost:30093`).
+## Состав репозитория
+
+| Файл | Назначение |
+|------|------------|
+| `producer.py` | Avro producer, 3 режима отправки |
+| `order.avsc` | Avro-схема сообщения |
+| `kafka-values.yaml` | Helm values для Kafka в Minikube |
+| `schema-registry.yaml` | Deployment Schema Registry |
+| `requirements.txt` | Python-зависимости |
 
 ## Требования
 
 - Python 3.9+
 - Minikube + Helm + kubectl
-- Доступ к брокеру на `localhost:30093`
+- Kafka на `localhost:30093`
+- Schema Registry на `localhost:8081`
 
-## Установка зависимостей
-
-```bash
-pip install -r requirements.txt
-```
-
-## Kafka в Minikube
+## 1. Kafka (если ещё не установлена)
 
 ```bash
 helm repo add bitnami https://charts.bitnami.com/bitnami
 helm repo update
-
 kubectl create namespace kafka
 
-helm install kafka bitnami/kafka \
+export CLUSTER_ID=$(kubectl get secret kafka-kraft -n kafka -o jsonpath='{.data.cluster-id}' | base64 -d 2>/dev/null)
+
+# первая установка
+helm upgrade --install kafka bitnami/kafka \
   --version 32.4.3 \
   --namespace kafka \
-  -f kafka-values.yaml
+  -f kafka-values.yaml \
+  ${CLUSTER_ID:+--set-string clusterId=$CLUSTER_ID}
 ```
 
-После старта:
+## 2. Schema Registry (Apicurio, Confluent-compatible API)
+
+Confluent Schema Registry в этой связке с Kafka 4 / Minikube зависал на leader election
+(`Joining schema registry with Kafka-based coordination`). Для учёбы используем
+**Apicurio Registry (in-memory)** с API, совместимым с Confluent SerDe:
 
 ```bash
-kubectl rollout status statefulset/kafka-controller -n kafka
+kubectl apply -f schema-registry.yaml
+kubectl rollout status deployment/schema-registry -n kafka
+```
 
+В `producer.py`:
+
+```python
+SCHEMA_REGISTRY_URL = "http://localhost:8081/apis/ccompat/v7"
+```
+
+## 3. Port-forward (два терминала)
+
+```bash
 kubectl port-forward -n kafka svc/kafka-controller-0-external 30093:9094
 ```
 
-В `producer.py` по умолчанию:
-
-```python
-BOOTSTRAP_SERVERS = ["localhost:30093"]
-TOPIC = "order"
+```bash
+kubectl port-forward -n kafka svc/schema-registry 8081:8081
 ```
 
-## Запуск producer
+Проверка Registry:
 
 ```bash
+curl -s http://localhost:8081/subjects
+```
+
+## 4. Python
+
+```bash
+pip install -r requirements.txt
 python producer.py
 ```
 
-## Полезные команды
+По умолчанию:
 
-Список топиков:
-
-```bash
-kubectl run kafka-client \
-  --restart=Never \
-  --image=docker.io/bitnamilegacy/kafka:4.0.0-debian-12-r10 \
-  -n kafka \
-  --command -- sleep infinity
-
-kubectl exec -it kafka-client -n kafka -- \
-  kafka-topics.sh --bootstrap-server kafka:9092 --list
+```python
+BOOTSTRAP_SERVERS = "localhost:30093"
+SCHEMA_REGISTRY_URL = "http://localhost:8081"
+TOPIC = "order"
 ```
 
-Чтение сообщений:
+## Что изменилось по сравнению с JSON
+
+- Вместо своих `Serializer`-классов используются `AvroSerializer` и `StringSerializer` из `confluent-kafka`
+- Формат value задаётся схемой `order.avsc`
+- Schema Registry хранит версию схемы; в сообщение пишется schema id
+
+## Полезные команды
+
+Список схем:
 
 ```bash
-kubectl exec -it kafka-client -n kafka -- \
-  kafka-console-consumer.sh \
-    --bootstrap-server kafka:9092 \
-    --topic order \
-    --partition 0 \
-    --offset earliest
+curl -s http://localhost:8081/subjects
+```
+
+Версии схемы топика (после первой отправки):
+
+```bash
+curl -s http://localhost:8081/subjects/order-value/versions
 ```
