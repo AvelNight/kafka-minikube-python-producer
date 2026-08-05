@@ -1,29 +1,29 @@
-# Kafka Python Avro Producer (Minikube)
+# Kafka producer (Minikube + Avro)
 
-Учебный пример Kafka producer на Python + **Avro** + **Schema Registry** с тремя режимами отправки:
+Заметки по локальному producer'у на Python. Кластер кручу в Minikube, сообщения — в Avro через Schema Registry.
 
-1. **Fire-and-forget** — отправил и забыл
-2. **Synchronous** — ждём подтверждение брокера
-3. **Asynchronous** — callback на успех/ошибку
+В `producer.py` три режима отправки:
 
-## Состав репозитория
+1. fire-and-forget
+2. sync (`flush` / ждём результат)
+3. async (callback)
 
-| Файл | Назначение |
-|------|------------|
-| `producer.py` | Avro producer, 3 режима отправки |
-| `order.avsc` | Avro-схема сообщения |
-| `kafka-values.yaml` | Helm values для Kafka в Minikube |
-| `schema-registry.yaml` | Deployment Schema Registry |
-| `requirements.txt` | Python-зависимости |
+## Файлы
 
-## Требования
+- `producer.py` — сам producer
+- `order.avsc` — схема Avro
+- `kafka-values.yaml` — Helm values для Bitnami Kafka
+- `schema-registry.yaml` — Apicurio Registry
+- `requirements.txt`
+
+## Что нужно
 
 - Python 3.9+
-- Minikube + Helm + kubectl
+- Minikube, Helm, kubectl
 - Kafka на `localhost:30093`
 - Schema Registry на `localhost:8081`
 
-## 1. Kafka (если ещё не установлена)
+## Поднять Kafka
 
 ```bash
 helm repo add bitnami https://charts.bitnami.com/bitnami
@@ -32,7 +32,6 @@ kubectl create namespace kafka
 
 export CLUSTER_ID=$(kubectl get secret kafka-kraft -n kafka -o jsonpath='{.data.cluster-id}' | base64 -d 2>/dev/null)
 
-# первая установка
 helm upgrade --install kafka bitnami/kafka \
   --version 32.4.3 \
   --namespace kafka \
@@ -40,70 +39,58 @@ helm upgrade --install kafka bitnami/kafka \
   ${CLUSTER_ID:+--set-string clusterId=$CLUSTER_ID}
 ```
 
-## 2. Schema Registry (Apicurio, Confluent-compatible API)
+В `kafka-values.yaml` для одного брокера выставлен `offsets.topic.replication.factor: 1`.
+Иначе не создаётся `__consumer_offsets`, и consumer groups / `subscribe()` не работают.
 
-Confluent Schema Registry в этой связке с Kafka 4 / Minikube зависал на leader election
-(`Joining schema registry with Kafka-based coordination`). Для учёбы используем
-**Apicurio Registry (in-memory)** с API, совместимым с Confluent SerDe:
+## Schema Registry
+
+Обычный Confluent Schema Registry у меня на этой связке зависал на leader election.
+Поставил Apicurio (in-memory) с Confluent-compatible API:
 
 ```bash
 kubectl apply -f schema-registry.yaml
 kubectl rollout status deployment/schema-registry -n kafka
 ```
 
-В `producer.py`:
+URL в коде:
 
 ```python
 SCHEMA_REGISTRY_URL = "http://localhost:8081/apis/ccompat/v7"
 ```
 
-## 3. Port-forward (два терминала)
+## Port-forward
 
 ```bash
 kubectl port-forward -n kafka svc/kafka-controller-0-external 30093:9094
-```
-
-```bash
 kubectl port-forward -n kafka svc/schema-registry 8081:8081
 ```
 
-Проверка Registry:
+Проверка registry:
 
 ```bash
-curl -s http://localhost:8081/subjects
+curl -s http://localhost:8081/apis/ccompat/v7/subjects
 ```
 
-## 4. Python
+## Запуск producer
 
 ```bash
 pip install -r requirements.txt
 python producer.py
 ```
 
-По умолчанию:
-
 ```python
 BOOTSTRAP_SERVERS = "localhost:30093"
-SCHEMA_REGISTRY_URL = "http://localhost:8081"
+SCHEMA_REGISTRY_URL = "http://localhost:8081/apis/ccompat/v7"
 TOPIC = "order"
 ```
 
-## Что изменилось по сравнению с JSON
+## Заметки
 
-- Вместо своих `Serializer`-классов используются `AvroSerializer` и `StringSerializer` из `confluent-kafka`
-- Формат value задаётся схемой `order.avsc`
-- Schema Registry хранит версию схемы; в сообщение пишется schema id
-
-## Полезные команды
-
-Список схем:
+- сериализация через `AvroSerializer` / `StringSerializer` из `confluent-kafka`
+- схема лежит в `order.avsc`, версии хранит Registry
+- после первой отправки появляется subject `order-value`:
 
 ```bash
-curl -s http://localhost:8081/subjects
-```
-
-Версии схемы топика (после первой отправки):
-
-```bash
-curl -s http://localhost:8081/subjects/order-value/versions
+curl -s http://localhost:8081/apis/ccompat/v7/subjects
+curl -s http://localhost:8081/apis/ccompat/v7/subjects/order-value/versions
 ```
