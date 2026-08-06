@@ -1,3 +1,6 @@
+> **Архив.** Актуальный код переехал в монорепо:
+> https://github.com/AvelNight/kafka-minikube-lab
+
 # Kafka Python Avro Producer (Minikube)
 
 Учебный пример Kafka producer на Python + **Avro** + **Schema Registry** с тремя режимами отправки:
